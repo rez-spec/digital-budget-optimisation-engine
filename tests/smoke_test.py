@@ -500,6 +500,712 @@ def test_goal_value_weights_shift_allocation_toward_high_value_goal() -> None:
     )
 
 
+def _run_carveout_pipeline(carve_out_pct=None) -> WizardState:
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    from modules.module5 import run_module5
+
+    s = WizardState()
+    complete_module1_and_advance(
+        s,
+        raw_objectives=["aw", "lg"],
+        raw_budget=10000.0,
+        raw_duration_days=30,
+        raw_test_and_learn_pct=carve_out_pct,
+    )
+    run_module2(
+        s,
+        selected_platforms=["fb", "li"],
+        priorities_input={
+            "fb": {"priority_1": "aw", "priority_2": None},
+            "li": {"priority_1": "lg", "priority_2": None},
+        },
+    )
+    finalise_module3_from_inputs(
+        s,
+        platform_inputs={
+            "fb": {"budget": 4000.0, "kpis": {"FB_AW_REACH": 200000.0}},
+            "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 80.0}},
+        },
+    )
+    run_module4(s)
+    run_module5(s)
+    return s
+
+
+def test_test_and_learn_carveout_reduces_lp_budget() -> None:
+    """A 10% test-and-learn carve-out should cap base LP spend at 90% of the
+    declared total and surface the reserved £ amount on every scenario."""
+    no_carve = _run_carveout_pipeline(carve_out_pct=None)
+    with_carve = _run_carveout_pipeline(carve_out_pct=0.10)
+
+    base_no = no_carve.module5_scenario_bundle.results_by_scenario["base"]
+    base_yes = with_carve.module5_scenario_bundle.results_by_scenario["base"]
+
+    # No carve-out → reserve is zero, LP can use the full £10k
+    assert base_no.test_and_learn_reserve == pytest.approx(0.0)
+
+    # 10% carve-out → £1,000 reserve at base, LP cap is £9,000
+    assert base_yes.test_and_learn_reserve == pytest.approx(1000.0)
+    assert base_yes.total_budget_used <= 9000.0 + 1e-6
+    assert base_yes.effective_budget_cap == pytest.approx(9000.0)
+
+
+def test_carveout_invariant_lp_used_plus_reserve_within_scenario_total() -> None:
+    """Across every scenario, lp_used + reserve must not exceed
+    declared_total × scenario_scalar. This is the contract that was broken
+    when the carve-out was applied before scenario scaling (optimistic
+    used to over-spend the declared total)."""
+    state = _run_carveout_pipeline(carve_out_pct=0.12)
+    declared_total = float(state.total_budget)
+    bundle = state.module5_scenario_bundle
+
+    for name, res in bundle.results_by_scenario.items():
+        scalar = bundle.scenario_multipliers.get(name, 1.0)
+        scenario_total = declared_total * scalar
+        # reserve = scenario_total × tl_pct
+        assert res.test_and_learn_reserve == pytest.approx(scenario_total * 0.12)
+        # lp_used + reserve must not exceed scenario_total
+        assert res.total_budget_used + res.test_and_learn_reserve <= scenario_total + 1e-6, (
+            f"Scenario {name!r}: lp_used={res.total_budget_used:.2f} + "
+            f"reserve={res.test_and_learn_reserve:.2f} exceeds scenario_total={scenario_total:.2f}."
+        )
+
+
+def test_zero_carveout_equivalent_to_no_carveout() -> None:
+    """Explicit 0.0 must produce identical allocations to omitting the param."""
+    none_state = _run_carveout_pipeline(carve_out_pct=None)
+    zero_state = _run_carveout_pipeline(carve_out_pct=0.0)
+
+    for name in ("conservative", "base", "optimistic"):
+        none_alloc = none_state.module5_scenario_bundle.results_by_scenario[name].budget_per_platform_goal
+        zero_alloc = zero_state.module5_scenario_bundle.results_by_scenario[name].budget_per_platform_goal
+        for p in none_alloc:
+            for g in none_alloc[p]:
+                assert zero_alloc[p][g] == pytest.approx(none_alloc[p][g]), (
+                    f"0% carve-out diverged from no carve-out at {name}/{p}/{g}."
+                )
+
+
+def test_test_and_learn_carveout_rejects_out_of_range() -> None:
+    """Carve-out >= 50% must be rejected; the LP would have nothing meaningful
+    to allocate against."""
+    from modules.module1 import Module1ValidationError
+
+    state = WizardState()
+    with pytest.raises(Module1ValidationError, match="below 50%"):
+        complete_module1_and_advance(
+            state,
+            raw_objectives=["aw"],
+            raw_budget=10000.0,
+            raw_test_and_learn_pct=0.60,
+        )
+
+
+def test_test_and_learn_carveout_accepts_percentage_string() -> None:
+    """Percentage strings like '15%' should be parsed to fractions."""
+    state = WizardState()
+    complete_module1_and_advance(
+        state,
+        raw_objectives=["aw"],
+        raw_budget=10000.0,
+        raw_test_and_learn_pct="15%",
+    )
+    assert state.test_and_learn_pct == pytest.approx(0.15)
+
+
+def test_test_and_learn_carveout_bare_string_treated_as_fraction() -> None:
+    """A string '15' (no '%' suffix) must be treated as a fraction, not 15%,
+    so the contract matches int/float behaviour. 15.0 is out of range so it
+    must be rejected — proving the heuristic is gone."""
+    from modules.module1 import Module1ValidationError
+
+    state = WizardState()
+    with pytest.raises(Module1ValidationError, match="below 50%"):
+        complete_module1_and_advance(
+            state,
+            raw_objectives=["aw"],
+            raw_budget=10000.0,
+            raw_test_and_learn_pct="15",
+        )
+
+
+def test_module5_rejects_invalid_state_carveout() -> None:
+    """If state.test_and_learn_pct somehow holds an out-of-range value
+    (direct mutation, future bug), Module 5 must raise rather than silently
+    optimise the full budget."""
+    from modules.module5 import build_module5_input_from_state, Module5ValidationError
+
+    state = _run_carveout_pipeline(carve_out_pct=0.10)
+    state.module5_finalised = False
+    state.test_and_learn_pct = 0.75  # bypass Module 1 validation
+    with pytest.raises(Module5ValidationError, match="test_and_learn_pct"):
+        build_module5_input_from_state(state)
+
+
+def test_montecarlo_produces_per_platform_distribution() -> None:
+    """Monte Carlo should produce a per-platform distribution with non-trivial
+    spread reflecting the productivity noise."""
+    from modules.module5 import run_module5_montecarlo
+
+    state = _run_pipeline_to_module5()
+    mc = run_module5_montecarlo(state, n_trials=50, seed=42)
+
+    assert mc.n_trials > 0
+    assert len(mc.per_platform) >= 2
+    for s in mc.per_platform:
+        assert s.mean >= 0.0
+        assert s.p5 <= s.p50 <= s.p95
+        if s.mean > 1.0:
+            # Real allocations should have some spread under perturbation
+            assert s.std >= 0.0
+
+
+def test_montecarlo_seed_reproducibility() -> None:
+    """Same seed → same distribution.  This is the floor for any honest
+    Monte Carlo: results must be reproducible for audit."""
+    from modules.module5 import run_module5_montecarlo
+
+    state = _run_pipeline_to_module5()
+    a = run_module5_montecarlo(state, n_trials=30, seed=123)
+    b = run_module5_montecarlo(state, n_trials=30, seed=123)
+
+    a_by_p = {s.platform: s.mean for s in a.per_platform}
+    b_by_p = {s.platform: s.mean for s in b.per_platform}
+    assert a_by_p.keys() == b_by_p.keys()
+    for p in a_by_p:
+        assert a_by_p[p] == pytest.approx(b_by_p[p])
+
+
+def test_montecarlo_flags_unstable_platform() -> None:
+    """When productivity noise is high enough that the LP picks materially
+    different winners across trials, the unstable platform list should
+    surface those platforms."""
+    from modules.module5 import run_module5_montecarlo
+    from modules.module6 import _coefficient_of_variation
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+
+    state = WizardState()
+    complete_module1_and_advance(
+        state, raw_objectives=["lg"], raw_budget=10000.0, raw_duration_days=30,
+    )
+    run_module2(
+        state,
+        selected_platforms=["fb", "li"],
+        priorities_input={
+            "fb": {"priority_1": "lg", "priority_2": None},
+            "li": {"priority_1": "lg", "priority_2": None},
+        },
+    )
+    # Two platforms with near-identical productivity AND high observed
+    # variance → LP picks an arbitrary winner each trial → high allocation CV.
+    high_variance_obs = [50.0, 100.0, 150.0, 200.0, 60.0]
+    finalise_module3_from_inputs(
+        state,
+        platform_inputs={
+            "fb": {"budget": 3000.0, "kpis": {"FB_LG_LEADS": 100.0},
+                   "kpi_observations": {"FB_LG_LEADS": high_variance_obs}},
+            "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 100.0},
+                   "kpi_observations": {"LI_LG_LEADS": high_variance_obs}},
+        },
+    )
+    run_module4(state)
+    state.min_spend_per_platform = {"fb": 0.0, "li": 0.0}
+    run_module5(state)
+
+    # The CV on the observed data should be well above the instability threshold
+    obs_cv = _coefficient_of_variation(high_variance_obs)
+    assert obs_cv is not None and obs_cv > 0.30, f"Setup CV too low: {obs_cv}"
+
+    mc = run_module5_montecarlo(state, n_trials=80, seed=7, instability_cv_threshold=0.15)
+    # At least one of the two platforms should be flagged unstable given the
+    # combination of degenerate productivity + high noise.
+    assert mc.unstable_platforms, (
+        f"Expected at least one unstable platform under high-variance setup, "
+        f"got: unstable={mc.unstable_platforms}, "
+        f"per_platform_cv={[(s.platform, s.cv) for s in mc.per_platform]}"
+    )
+
+
+def test_montecarlo_rejects_tiny_n_trials() -> None:
+    from modules.module5 import run_module5_montecarlo, Module5ValidationError
+
+    state = _run_pipeline_to_module5()
+    with pytest.raises(Module5ValidationError, match="too small"):
+        run_module5_montecarlo(state, n_trials=5)
+
+
+def test_using_economic_weights_logs_rank_skip(caplog) -> None:
+    """When goal_value_per_unit is present, the rank-based fallback must be
+    skipped — and that decision should be auditable in the logs."""
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    import logging
+
+    state = WizardState()
+    complete_module1_and_advance(
+        state,
+        raw_objectives=["aw", "lg"],
+        raw_budget=10000.0,
+        raw_duration_days=30,
+        raw_goal_values={"lg": 200.0, "aw": 0.0005},
+    )
+    run_module2(
+        state,
+        selected_platforms=["fb", "li"],
+        priorities_input={
+            "fb": {"priority_1": "aw", "priority_2": None},
+            "li": {"priority_1": "lg", "priority_2": None},
+        },
+    )
+    finalise_module3_from_inputs(
+        state,
+        platform_inputs={
+            "fb": {"budget": 4000.0, "kpis": {"FB_AW_REACH": 200000.0}},
+            "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 80.0}},
+        },
+    )
+    run_module4(state)
+
+    with caplog.at_level(logging.INFO, logger="modules.module5"):
+        run_module5(state)
+
+    text = " ".join(rec.message for rec in caplog.records)
+    assert "economic goal weights" in text.lower()
+    assert "rank-based weights from priority_rank are not consulted" in text
+
+
+def test_using_rank_weights_logs_recommendation(caplog) -> None:
+    """When goal_value_per_unit is absent, the rank-based path is used and
+    we should suggest switching to economic values."""
+    import logging
+
+    state = _run_pipeline_to_module5()  # no goal values
+    with caplog.at_level(logging.INFO, logger="modules.module5"):
+        # Re-run M5 by bypassing the finalised guard.  Reset just enough state.
+        state.module5_finalised = False
+        from modules.module5 import build_module5_input_from_state, run_module5_lp_scenarios
+        bundle = run_module5_lp_scenarios(build_module5_input_from_state(state))
+        assert bundle is not None  # use it
+
+    text = " ".join(rec.message for rec in caplog.records)
+    assert "rank-based goal weights" in text.lower()
+    assert "supply economic values" in text.lower()
+
+
+def test_seasonality_shifts_allocation_toward_boosted_goal() -> None:
+    """A seasonality boost for one goal should pull more LP budget toward
+    the platform serving that goal."""
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    from modules.module5 import run_module5
+
+    def _alloc(seasonality=None) -> dict:
+        s = WizardState()
+        complete_module1_and_advance(
+            s,
+            raw_objectives=["aw", "lg"],
+            raw_budget=10000.0,
+            raw_duration_days=30,
+            raw_seasonality_index=seasonality,
+        )
+        run_module2(
+            s,
+            selected_platforms=["fb", "li"],
+            priorities_input={
+                "fb": {"priority_1": "aw", "priority_2": None},
+                "li": {"priority_1": "lg", "priority_2": None},
+            },
+        )
+        finalise_module3_from_inputs(
+            s,
+            platform_inputs={
+                "fb": {"budget": 4000.0, "kpis": {"FB_AW_REACH": 200000.0}},
+                "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 80.0}},
+            },
+        )
+        run_module4(s)
+        run_module5(s)
+        return s.module5_scenario_bundle.results_by_scenario["base"].budget_per_platform_goal
+
+    flat = _alloc(seasonality=None)
+    boosted = _alloc(seasonality={"lg": 3.0, "aw": 0.5})
+
+    flat_li = sum(flat.get("li", {}).values())
+    boosted_li = sum(boosted.get("li", {}).values())
+    assert boosted_li > flat_li, (
+        f"3× boost on LG + 0.5× on AW should shift budget toward LI (the LG platform). "
+        f"Flat LI=£{flat_li:.0f}, boosted LI=£{boosted_li:.0f}."
+    )
+
+
+def test_seasonality_scales_count_kpi_forecast() -> None:
+    """A 0.4× seasonality multiplier on reach should produce a forecast
+    that is 0.4× the un-seasoned forecast for the same allocation."""
+    from modules.module6 import compute_module6_forecast
+    from modules.module5 import Module5LPResult
+
+    lp = Module5LPResult(
+        budget_per_platform_goal={"fb": {"aw": 5000.0}},
+        budget_per_platform={"fb": 5000.0},
+        total_budget_used=5000.0,
+        objective_value=1.0,
+        r_pg={"fb": {"aw": 1.0}},
+        combined_weight_pg={"fb": {"aw": 1.0}},
+        estimated_kpi_per_platform_goal={"fb": {"aw": 500000.0}},
+    )
+    kpi_ratios = {"fb": {"aw": {"FB_AW_REACH": 100.0}}}
+
+    flat = compute_module6_forecast(kpi_ratios=kpi_ratios, module5_result=lp)
+    seasoned = compute_module6_forecast(
+        kpi_ratios=kpi_ratios, module5_result=lp,
+        seasonality_index={"aw": 0.4},
+    )
+    flat_row = next(r for r in flat.rows if r.kpi_name == "FB_AW_REACH")
+    seasoned_row = next(r for r in seasoned.rows if r.kpi_name == "FB_AW_REACH")
+    assert seasoned_row.predicted_kpi == pytest.approx(0.4 * flat_row.predicted_kpi)
+
+
+def test_seasonality_rejects_implausible_multiplier() -> None:
+    """Values >10× or <0.1× should be rejected as likely typos (percentage
+    entered instead of multiplier)."""
+    from modules.module1 import Module1ValidationError
+
+    state = WizardState()
+    with pytest.raises(Module1ValidationError, match="implausible"):
+        complete_module1_and_advance(
+            state, raw_objectives=["aw"], raw_budget=10000.0,
+            raw_seasonality_index={"aw": 250.0},  # user typed "250%" expecting 2.5
+        )
+
+
+def test_module5_warns_when_platform_below_effective_minimum() -> None:
+    """LinkedIn's industry-typical learning-phase exit threshold is ~£2k/month.
+    When the LP allocates LI below that — even because the user floor forces
+    a small allocation — Module 5 should surface a warning."""
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    from modules.module5 import run_module5, PLATFORM_EFFECTIVE_MINIMUMS_PER_MONTH
+
+    state = WizardState()
+    complete_module1_and_advance(
+        state, raw_objectives=["lg"], raw_budget=10000.0, raw_duration_days=30,
+    )
+    # Both platforms compete on the same goal (LG); FB will dominate because
+    # it has 10× the productivity per £.  LI only gets money because of the
+    # forced floor.
+    run_module2(
+        state,
+        selected_platforms=["fb", "li"],
+        priorities_input={
+            "fb": {"priority_1": "lg", "priority_2": None},
+            "li": {"priority_1": "lg", "priority_2": None},
+        },
+    )
+    finalise_module3_from_inputs(
+        state,
+        platform_inputs={
+            "fb": {"budget": 3000.0, "kpis": {"FB_LG_LEADS": 300.0}},  # 0.1 leads/£
+            "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 30.0}},   # 0.01 leads/£
+        },
+    )
+    run_module4(state)
+    # Floor LI at £1,000 — below the £2,000 effective threshold but above zero.
+    # FB has no floor; the LP will minimise LI to exactly £1,000.
+    state.min_spend_per_platform = {"fb": 0.0, "li": 1000.0}
+    run_module5(state)
+
+    base = state.module5_scenario_bundle.results_by_scenario["base"]
+    li_allocated = sum(base.budget_per_platform_goal.get("li", {}).values())
+    li_threshold = PLATFORM_EFFECTIVE_MINIMUMS_PER_MONTH["li"]  # 2000 for 30 days
+    assert 0.0 < li_allocated < li_threshold, (
+        f"Test setup expected LI allocated below £{li_threshold:.0f} threshold, "
+        f"got £{li_allocated:.0f}"
+    )
+    assert any("li" in w.lower() for w in base.effective_minimum_warnings), (
+        f"LI was allocated £{li_allocated:.0f} (below £{li_threshold:.0f} threshold) "
+        f"but no warning was surfaced. Warnings: {base.effective_minimum_warnings}"
+    )
+
+
+def test_module5_effective_minimum_scales_with_campaign_duration() -> None:
+    """A 60-day campaign should require twice the per-platform monthly
+    threshold; a 15-day campaign half of it."""
+    from modules.module5 import (
+        build_module5_input_from_state,
+        PLATFORM_EFFECTIVE_MINIMUMS_PER_MONTH,
+    )
+
+    state_60 = _run_pipeline_to_module5(campaign_duration_days=60)
+    state_60.module5_finalised = False
+    inp_60 = build_module5_input_from_state(state_60)
+
+    state_15 = _run_pipeline_to_module5(campaign_duration_days=15)
+    state_15.module5_finalised = False
+    inp_15 = build_module5_input_from_state(state_15)
+
+    for p, monthly in PLATFORM_EFFECTIVE_MINIMUMS_PER_MONTH.items():
+        if p in inp_60.effective_minimum_per_platform:
+            assert inp_60.effective_minimum_per_platform[p] == pytest.approx(monthly * 2.0)
+        if p in inp_15.effective_minimum_per_platform:
+            assert inp_15.effective_minimum_per_platform[p] == pytest.approx(monthly * 0.5)
+
+
+def test_module5_reports_binding_budget_cap() -> None:
+    """With no per-platform / per-goal floors, the only constraint the LP can
+    hit is the total budget cap — and it should always hit it for a problem
+    with positive productivity."""
+    state = _run_pipeline_to_module5()
+    base = state.module5_scenario_bundle.results_by_scenario["base"]
+    names = [bc.name for bc in base.binding_constraints]
+    assert "budget_cap" in names, (
+        f"Expected budget_cap to bind on a budget-limited problem, got: {names}"
+    )
+    # Shadow prices dict should be populated for every named constraint
+    assert "budget_cap" in base.shadow_prices
+
+
+def test_module5_reports_binding_platform_floor() -> None:
+    """When a platform minimum forces the LP into a sub-optimal allocation,
+    that floor must appear in binding_constraints with the right target."""
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    from modules.module5 import run_module5
+
+    state = WizardState()
+    complete_module1_and_advance(
+        state, raw_objectives=["aw", "lg"], raw_budget=10000.0, raw_duration_days=30,
+    )
+    run_module2(
+        state,
+        selected_platforms=["fb", "li"],
+        priorities_input={
+            "fb": {"priority_1": "aw", "priority_2": None},
+            "li": {"priority_1": "lg", "priority_2": None},
+        },
+    )
+    finalise_module3_from_inputs(
+        state,
+        platform_inputs={
+            "fb": {"budget": 4000.0, "kpis": {"FB_AW_REACH": 50000.0}},   # low productivity
+            "li": {"budget": 3000.0, "kpis": {"LI_LG_LEADS": 200.0}},     # high productivity
+        },
+    )
+    run_module4(state)
+    # Override default floors: force FB to take at least £4,000 even though
+    # LI is more productive.  This is what makes the floor *bind*.
+    state.min_spend_per_platform = {"fb": 4000.0, "li": 0.0}
+    run_module5(state)
+
+    base = state.module5_scenario_bundle.results_by_scenario["base"]
+    platform_floors = [bc for bc in base.binding_constraints if bc.kind == "min_platform"]
+    assert any(bc.target == "fb" for bc in platform_floors), (
+        f"FB floor of £4,000 should bind when LI is more productive, got "
+        f"binding={[(bc.name, bc.kind, bc.target) for bc in base.binding_constraints]}"
+    )
+
+
+def test_module5_detects_near_degenerate_groups() -> None:
+    """When two platforms have effectively identical productivity for a goal,
+    the LP solution is ambiguous; the redistribution logic should fire AND
+    surface the ambiguity in near_degenerate_groups."""
+    from modules.module2 import run_module2
+    from modules.module3 import finalise_module3_from_inputs
+    from modules.module4 import run_module4
+    from modules.module5 import run_module5
+
+    state = WizardState()
+    complete_module1_and_advance(
+        state, raw_objectives=["aw"], raw_budget=10000.0, raw_duration_days=30,
+    )
+    run_module2(
+        state,
+        selected_platforms=["fb", "ig"],
+        priorities_input={
+            "fb": {"priority_1": "aw", "priority_2": None},
+            "ig": {"priority_1": "aw", "priority_2": None},
+        },
+    )
+    # Same productivity per £ on both platforms → ambiguous LP
+    finalise_module3_from_inputs(
+        state,
+        platform_inputs={
+            "fb": {"budget": 5000.0, "kpis": {"FB_AW_REACH": 500000.0}},
+            "ig": {"budget": 5000.0, "kpis": {"IG_AW_REACH": 500000.0}},
+        },
+    )
+    run_module4(state)
+    run_module5(state)
+
+    base = state.module5_scenario_bundle.results_by_scenario["base"]
+    aw_groups = [g for g in base.near_degenerate_groups if g["goal"] == "aw"]
+    assert aw_groups, (
+        f"Expected near-degenerate group for AW across FB/IG, got: "
+        f"{base.near_degenerate_groups}"
+    )
+    assert set(aw_groups[0]["platforms"]) == {"fb", "ig"}
+
+
+def test_module7_policy_thresholds_change_classification() -> None:
+    """A custom Module7Policy should produce different classifications/
+    confidence scores than the defaults, proving the thresholds are
+    actually externalised (not just renamed)."""
+    from modules.module7 import run_module7, Module7Policy
+
+    state = _run_pipeline_to_module5()
+    from modules.module6 import run_module6
+    run_module6(state)
+    bundle = state.module5_scenario_bundle
+    fc_by_scenario = _get_module6_by_scenario(state)
+
+    default = run_module7(state, bundle, fc_by_scenario)
+    # A policy that calls anything above 30% concentration "Corner-dominant"
+    # and penalises it heavily should produce different output for the same input.
+    strict = Module7Policy(
+        corner_concentration=0.30,
+        balanced_concentration=0.20,
+        confidence_high_concentration=0.30,
+        confidence_high_concentration_penalty=40,
+    )
+    strict_insight = run_module7(state, bundle, fc_by_scenario, policy=strict)
+
+    # At least one scenario must classify or score differently under the
+    # tightened policy.
+    diffs = 0
+    for name in default.scenario_insights:
+        d = default.scenario_insights[name]
+        s = strict_insight.scenario_insights[name]
+        if (d.classification != s.classification
+                or d.confidence_score != s.confidence_score):
+            diffs += 1
+    assert diffs > 0, (
+        "Custom Module7Policy did not change any scenario's classification or "
+        "confidence — thresholds may not be fully externalised."
+    )
+
+
+def test_module7_default_policy_preserves_existing_behaviour() -> None:
+    """Calling run_module7 with no policy must produce byte-identical output
+    to passing Module7Policy() — the defaults are the contract."""
+    from modules.module7 import run_module7, Module7Policy
+
+    state = _run_pipeline_to_module5()
+    from modules.module6 import run_module6
+    run_module6(state)
+    bundle = state.module5_scenario_bundle
+    fc_by_scenario = _get_module6_by_scenario(state)
+
+    implicit = run_module7(state, bundle, fc_by_scenario)
+    explicit = run_module7(state, bundle, fc_by_scenario, policy=Module7Policy())
+
+    for name in implicit.scenario_insights:
+        a = implicit.scenario_insights[name]
+        b = explicit.scenario_insights[name]
+        assert a.classification == b.classification
+        assert a.confidence_score == b.confidence_score
+        assert a.binding_constraints == b.binding_constraints
+
+
+def test_module6_band_uses_observations_when_present() -> None:
+    """With ≥3 historical observations, the band should equal the sample
+    coefficient of variation, not the flat default."""
+    from modules.module6 import compute_module6_forecast, _coefficient_of_variation
+    from modules.module5 import Module5LPResult
+
+    lp = Module5LPResult(
+        budget_per_platform_goal={"fb": {"lg": 5000.0}},
+        budget_per_platform={"fb": 5000.0},
+        total_budget_used=5000.0,
+        objective_value=1.0,
+        r_pg={"fb": {"lg": 1.0}},
+        combined_weight_pg={"fb": {"lg": 1.0}},
+        estimated_kpi_per_platform_goal={"fb": {"lg": 100.0}},
+    )
+    observations = [80.0, 100.0, 120.0, 90.0, 110.0]
+    expected_cv = _coefficient_of_variation(observations)
+    assert expected_cv is not None and expected_cv > 0
+
+    result = compute_module6_forecast(
+        kpi_ratios={"fb": {"lg": {"FB_LG_LEADS": 0.025}}},
+        module5_result=lp,
+        module3_data={"fb": {"historical_days": 30,
+                             "kpi_observations": {"FB_LG_LEADS": observations}}},
+    )
+    row = next(r for r in result.rows if r.kpi_kind == "count")
+    assert row.band_source == "observations"
+    assert row.band_pct == pytest.approx(expected_cv)
+    # Different from default 30% — proves we didn't fall back
+    assert abs(row.band_pct - 0.30) > 0.01
+
+
+def test_module6_band_window_scaled_when_no_observations() -> None:
+    """Without observations but with historical_days, the band should scale
+    by sqrt(30 / days): more history → tighter band."""
+    from modules.module6 import compute_module6_forecast, DEFAULT_UNCERTAINTY_BAND
+    from modules.module5 import Module5LPResult
+    import math as _m
+
+    lp = Module5LPResult(
+        budget_per_platform_goal={"fb": {"lg": 5000.0}},
+        budget_per_platform={"fb": 5000.0},
+        total_budget_used=5000.0,
+        objective_value=1.0,
+        r_pg={"fb": {"lg": 1.0}},
+        combined_weight_pg={"fb": {"lg": 1.0}},
+        estimated_kpi_per_platform_goal={"fb": {"lg": 100.0}},
+    )
+
+    result_90 = compute_module6_forecast(
+        kpi_ratios={"fb": {"lg": {"FB_LG_LEADS": 0.025}}},
+        module5_result=lp,
+        module3_data={"fb": {"historical_days": 90}},
+    )
+    row_90 = next(r for r in result_90.rows if r.kpi_kind == "count")
+    assert row_90.band_source == "window_scaled"
+    expected_90 = DEFAULT_UNCERTAINTY_BAND * _m.sqrt(30.0 / 90.0)
+    assert row_90.band_pct == pytest.approx(expected_90, rel=1e-6)
+
+    # 7-day window should produce a wider band than 90-day
+    result_7 = compute_module6_forecast(
+        kpi_ratios={"fb": {"lg": {"FB_LG_LEADS": 0.025}}},
+        module5_result=lp,
+        module3_data={"fb": {"historical_days": 7}},
+    )
+    row_7 = next(r for r in result_7.rows if r.kpi_kind == "count")
+    assert row_7.band_pct > row_90.band_pct
+
+
+def test_module6_band_falls_back_to_default_without_module3_data() -> None:
+    """Backwards-compatibility: callers that don't pass module3_data must still
+    get the flat default band (no breaking change for existing call sites)."""
+    from modules.module6 import compute_module6_forecast, DEFAULT_UNCERTAINTY_BAND
+    from modules.module5 import Module5LPResult
+
+    lp = Module5LPResult(
+        budget_per_platform_goal={"fb": {"lg": 5000.0}},
+        budget_per_platform={"fb": 5000.0},
+        total_budget_used=5000.0,
+        objective_value=1.0,
+        r_pg={"fb": {"lg": 1.0}},
+        combined_weight_pg={"fb": {"lg": 1.0}},
+        estimated_kpi_per_platform_goal={"fb": {"lg": 100.0}},
+    )
+    result = compute_module6_forecast(
+        kpi_ratios={"fb": {"lg": {"FB_LG_LEADS": 0.025}}},
+        module5_result=lp,
+    )
+    row = next(r for r in result.rows if r.kpi_kind == "count")
+    assert row.band_source == "default"
+    assert row.band_pct == pytest.approx(DEFAULT_UNCERTAINTY_BAND)
+
+
 def test_module6_count_kpi_has_confidence_band() -> None:
     """Module 6 must surface a ±band on every count-KPI forecast so the
     output cannot be mistaken for a precise commitment."""

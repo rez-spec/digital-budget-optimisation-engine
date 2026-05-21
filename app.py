@@ -11,10 +11,20 @@ from reportlab.lib.styles import getSampleStyleSheet  # type: ignore
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
 
 from core.wizard_state import WizardState, GOAL_AW, GOAL_EN, GOAL_LG, GOAL_WT
+from modules.module1 import (
+    complete_module1_and_advance as finalise_module1,
+    Module1ValidationError,
+)
 from core.kpi_config import KPI_CONFIG
 from modules.module2 import run_module2
 from modules.module4 import run_module4
-from modules.module5 import Module5LPResult, Module5ScenarioBundle, run_module5
+from modules.module5 import (
+    Module5LPResult,
+    Module5ScenarioBundle,
+    run_module5,
+    run_module5_montecarlo,
+    DEFAULT_MC_TRIALS,
+)
 from modules.module6 import Module6Result, Module6ScenarioResult, run_module6
 
 from modules.module7 import Module7BundleInsight, run_module7
@@ -618,108 +628,6 @@ def create_pdf_bytes(
     return buffer.getvalue()
 
 
-def module1_ui(state: WizardState) -> None:
-    st.header("Objectives and total budget")
-
-    goals = st.multiselect(
-        "Choose one or more marketing objectives:",
-        options=[
-            (GOAL_AW, "Awareness"),
-            (GOAL_EN, "Engagement"),
-            (GOAL_WT, "Website Traffic"),
-            (GOAL_LG, "Lead Generation"),
-        ],
-        format_func=lambda x: x[1],
-    )
-    goal_codes = [code for code, _ in goals]
-
-    total_budget = st.number_input(
-        "Enter your total budget (must be greater than 1)",
-        min_value=1.0,
-        value=1000.0,
-        step=100.0,
-    )
-
-    if st.button("Continue", disabled=not goal_codes or total_budget <= 1):
-        state.complete_module1_and_advance(valid_goals=goal_codes, total_budget=total_budget)
-        safe_rerun()
-
-
-def module2_ui(state: WizardState) -> None:
-    st.header("Platforms and priorities")
-
-    platforms = ["fb", "ig", "li", "yt"]
-    selected_platforms = st.multiselect(
-        "Choose one or more platforms:",
-        options=platforms,
-        format_func=lambda p: PLATFORM_NAMES.get(str(p).lower(), str(p)),
-    )
-
-    priorities_input: Dict[str, Dict[str, Optional[str]]] = {}
-    is_valid = True
-
-    for p in selected_platforms:
-        platform_name = PLATFORM_NAMES.get(p, p)
-        st.subheader(platform_name)
-
-        p1_key = f"{p}_p1"
-        p2_key = f"{p}_p2"
-
-        p1 = st.selectbox(
-            f"Priority 1 objective for {platform_name}",
-            options=[None] + list(state.valid_goals),
-            format_func=lambda x: {
-                None: "(none)",
-                GOAL_AW: "Awareness",
-                GOAL_EN: "Engagement",
-                GOAL_WT: "Website Traffic",
-                GOAL_LG: "Lead Generation",
-            }.get(x, str(x)),
-            key=p1_key,
-        )
-
-        allowed_p2_options = [None] + [g for g in state.valid_goals if g != p1]
-
-        current_p2 = st.session_state.get(p2_key, None)
-        if current_p2 == p1 and current_p2 is not None:
-            st.session_state[p2_key] = None
-            current_p2 = None
-
-        p2 = st.selectbox(
-            f"Priority 2 objective for {platform_name}",
-            options=allowed_p2_options,
-            format_func=lambda x: {
-                None: "(none)",
-                GOAL_AW: "Awareness",
-                GOAL_EN: "Engagement",
-                GOAL_WT: "Website Traffic",
-                GOAL_LG: "Lead Generation",
-            }.get(x, str(x)),
-            key=p2_key,
-        )
-
-        if p2 is not None and p1 is None:
-            is_valid = False
-            st.error("Priority 2 cannot be set without Priority 1.")
-
-        if p1 is not None and p2 is not None and p1 == p2:
-            is_valid = False
-            st.error("Priority 1 and Priority 2 must be different.")
-
-        if len(state.valid_goals) == 1 and p2 is not None:
-            is_valid = False
-            st.error("Priority 2 cannot be set when there is only one selected objective.")
-
-        priorities_input[p] = {"priority_1": p1, "priority_2": p2}
-
-    if st.button("Continue", disabled=(not selected_platforms) or (not is_valid)):
-        try:
-            run_module2(state, selected_platforms, priorities_input)
-            safe_rerun()
-        except Exception:
-            st.error("Please review your selections and try again.")
-
-
 def module3_ui(state: WizardState) -> None:
     st.header("Historical data")
 
@@ -996,6 +904,169 @@ def results_ui(state: WizardState) -> None:
 
             st.markdown("---")
 
+    # ── Solver diagnostics (auditable "why this allocation?") ──────────────
+    # Surfaces the LP signals that already exist on every Module5LPResult
+    # but were previously hidden from the UI.  Focused on the base scenario;
+    # the per-scenario tabs below still let the user dig deeper.
+    base_lp = lp_by_scenario.get("base") or (
+        lp_by_scenario.get(scenario_keys[0]) if scenario_keys else None
+    )
+    if base_lp is not None and (
+        base_lp.binding_constraints
+        or base_lp.shadow_prices
+        or base_lp.effective_minimum_warnings
+        or base_lp.near_degenerate_groups
+        or base_lp.test_and_learn_reserve > 0.0
+    ):
+        with st.expander("Solver diagnostics", expanded=False):
+            st.caption(
+                "What constraints actually shaped the optimiser's choice, "
+                "and how sensitive the allocation is to each one."
+            )
+
+            if base_lp.test_and_learn_reserve > 0.0:
+                st.markdown(
+                    f"**Test-and-learn reserve (base scenario):** "
+                    f"{money(base_lp.test_and_learn_reserve)} held back from the LP."
+                )
+
+            if base_lp.binding_constraints:
+                st.markdown("**Binding constraints** — these stopped the LP from doing better:")
+                binding_rows = []
+                for bc in base_lp.binding_constraints:
+                    target_label = ""
+                    if bc.kind == "min_platform":
+                        target_label = PLATFORM_NAMES.get(str(bc.target).lower(), str(bc.target))
+                    elif bc.kind == "min_goal":
+                        target_label = _GOAL_LABEL.get(str(bc.target).lower(), str(bc.target))
+                    elif bc.kind == "budget_cap":
+                        target_label = "(total)"
+                    binding_rows.append({
+                        "Constraint": bc.name,
+                        "Kind": bc.kind,
+                        "Target": target_label,
+                        "Limit": money(bc.rhs),
+                        "Shadow price": number(bc.shadow_price, 4),
+                    })
+                st.dataframe(pd.DataFrame(binding_rows),
+                             use_container_width=True, hide_index=True)
+                st.caption(
+                    "Shadow price ≈ how much the objective would change if you "
+                    "relaxed the constraint by one unit.  Positive on min floors "
+                    "(forcing spend hurts the objective), negative on the budget cap "
+                    "(more budget would help)."
+                )
+
+            # Top-3 shadow prices (by absolute value), excluding the already-shown bindings
+            if base_lp.shadow_prices:
+                already_shown = {bc.name for bc in base_lp.binding_constraints}
+                other = [
+                    (name, pi) for name, pi in base_lp.shadow_prices.items()
+                    if name not in already_shown and abs(pi) > 1e-9
+                ]
+                if other:
+                    other.sort(key=lambda kv: abs(kv[1]), reverse=True)
+                    top = other[:3]
+                    st.markdown("**Largest non-binding sensitivities:**")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Constraint": name, "Shadow price": number(pi, 4)}
+                            for name, pi in top
+                        ]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            if base_lp.effective_minimum_warnings:
+                st.markdown("**Below industry-effective spend** — these platforms may not exit the learning phase:")
+                for w in base_lp.effective_minimum_warnings:
+                    st.warning(w)
+
+            if base_lp.near_degenerate_groups:
+                st.markdown("**Near-degenerate cells** — productivity was effectively tied:")
+                for grp in base_lp.near_degenerate_groups:
+                    g_label = _GOAL_LABEL.get(str(grp.get("goal", "")).lower(), str(grp.get("goal", "")))
+                    plats = ", ".join(
+                        PLATFORM_NAMES.get(str(p).lower(), str(p)) for p in grp.get("platforms", [])
+                    )
+                    st.caption(
+                        f"{g_label}: {plats} — split was set by proportional "
+                        f"redistribution, not by a meaningful productivity gap."
+                    )
+
+    # ── Monte Carlo robustness ─────────────────────────────────────────────
+    # On-demand because n_trials LP solves is the expensive bit (~1-5 s).
+    # Caches the result in session state so toggling other UI elements
+    # doesn't re-run the whole batch.
+    with st.expander("Robustness check (Monte Carlo)", expanded=False):
+        st.caption(
+            "Re-solves the base scenario hundreds of times with productivities "
+            "perturbed by their observed noise.  Surfaces platforms whose share "
+            "is sensitive to the underlying assumptions."
+        )
+        col_n, col_seed, col_run = st.columns([1, 1, 1])
+        with col_n:
+            n_trials = st.number_input(
+                "Trials", min_value=20, max_value=500,
+                value=int(DEFAULT_MC_TRIALS), step=20,
+                help="More trials = tighter percentiles, more runtime.",
+            )
+        with col_seed:
+            seed = st.number_input(
+                "Seed", min_value=0, max_value=2_147_483_647,
+                value=42, step=1,
+                help="Reproducibility — same seed gives the same distribution.",
+            )
+        with col_run:
+            st.write("")  # vertical spacer to line up with inputs
+            run_mc = st.button("Run robustness check", type="primary")
+
+        if run_mc:
+            try:
+                with st.spinner(f"Running {int(n_trials)} LP solves..."):
+                    mc_result = run_module5_montecarlo(
+                        state, n_trials=int(n_trials), seed=int(seed),
+                    )
+                st.session_state["_mc_result"] = mc_result
+            except Exception as e:
+                st.error(f"Monte Carlo failed: {e}")
+
+        mc_result = st.session_state.get("_mc_result")
+        if mc_result is not None:
+            st.caption(
+                f"{mc_result.n_trials} trials completed (seed={mc_result.seed}). "
+                f"Instability threshold: CV > {mc_result.instability_threshold:.0%}."
+            )
+
+            if mc_result.unstable_platforms:
+                names = ", ".join(
+                    PLATFORM_NAMES.get(p, p) for p in mc_result.unstable_platforms
+                )
+                st.warning(
+                    f"Unstable platforms: {names}. "
+                    f"Allocation rank for these platforms is sensitive to "
+                    f"plausible productivity noise — don't bet the campaign on them."
+                )
+            else:
+                st.success(
+                    "No platform's allocation moved meaningfully under perturbation — "
+                    "the plan is robust to the noise in the input data."
+                )
+
+            platform_rows = []
+            for s in mc_result.per_platform:
+                platform_rows.append({
+                    "Platform": PLATFORM_NAMES.get(s.platform, s.platform),
+                    "Mean": money(s.mean),
+                    "p5": money(s.p5),
+                    "Median": money(s.p50),
+                    "p95": money(s.p95),
+                    "CV": f"{s.cv:.1%}",
+                })
+            if platform_rows:
+                st.markdown("**Per-platform allocation distribution:**")
+                st.dataframe(pd.DataFrame(platform_rows),
+                             use_container_width=True, hide_index=True)
+
     tabs = st.tabs([_human_scenario_name(k) for k in scenario_keys])
     scenario_payload_for_exports: List[Tuple[str, Module5LPResult, Optional[Module6Result]]] = []
 
@@ -1134,9 +1205,28 @@ def results_ui(state: WizardState) -> None:
         reset_state()
 
 
+# Default £-per-unit values shown as placeholders in the Module 1 form.
+# These are sensible starting points for a UK B2B SaaS context, not
+# universal truths — the user is meant to override them.
+_GOAL_VALUE_HINTS: Dict[str, Tuple[str, float]] = {
+    GOAL_LG: ("£ per qualified lead", 100.0),
+    GOAL_WT: ("£ per website click", 0.50),
+    GOAL_EN: ("£ per engagement", 0.20),
+    GOAL_AW: ("£ per reach impression", 0.001),
+}
+
+_GOAL_LABEL: Dict[str, str] = {
+    GOAL_AW: "Awareness",
+    GOAL_EN: "Engagement",
+    GOAL_WT: "Website Traffic",
+    GOAL_LG: "Lead Generation",
+}
+
+
 def module1_ui(state: WizardState) -> None:
     st.header("Objectives and total budget")
 
+    # ── Core inputs ────────────────────────────────────────────────────────
     goals = st.multiselect(
         "Choose one or more marketing objectives:",
         options=[
@@ -1149,16 +1239,103 @@ def module1_ui(state: WizardState) -> None:
     )
     goal_codes = [code for code, _ in goals]
 
-    total_budget = st.number_input(
-        "Enter your total budget (must be greater than 1)",
-        min_value=1.0,
-        value=1000.0,
-        step=100.0,
-    )
+    col_budget, col_currency, col_duration = st.columns([2, 1, 1])
+    with col_budget:
+        total_budget = st.number_input(
+            "Total budget",
+            min_value=1.0,
+            value=10000.0,
+            step=500.0,
+            help="The full campaign budget — including any test-and-learn reserve.",
+        )
+    with col_currency:
+        currency = st.selectbox("Currency", options=["GBP", "USD", "EUR"], index=0)
+    with col_duration:
+        duration_days = st.number_input(
+            "Campaign days",
+            min_value=1,
+            value=30,
+            step=1,
+            help="Used to scale industry-effective minimums and historical-window confidence bands.",
+        )
+
+    # ── Goal values (utility weights) ──────────────────────────────────────
+    goal_values: Dict[str, float] = {}
+    if goal_codes:
+        st.markdown("### What is each result worth to the business?")
+        st.caption(
+            "Set the £ value of one unit of each objective's KPI. The optimiser "
+            "uses these as utility weights — without them it falls back to "
+            "rank-based heuristics. Leave at 0 to skip."
+        )
+        cols = st.columns(min(len(goal_codes), 4))
+        for i, gcode in enumerate(goal_codes):
+            label, default = _GOAL_VALUE_HINTS.get(gcode, (f"£ per {gcode}", 1.0))
+            with cols[i % len(cols)]:
+                v = st.number_input(
+                    f"{_GOAL_LABEL.get(gcode, gcode)} — {label}",
+                    min_value=0.0,
+                    value=float(default),
+                    step=max(default / 10.0, 0.001),
+                    format="%.4f",
+                    key=f"goal_value_{gcode}",
+                )
+                if v > 0:
+                    goal_values[gcode] = v
+
+    # ── Advanced policy inputs ─────────────────────────────────────────────
+    with st.expander("Advanced policy (test-and-learn, seasonality)", expanded=False):
+        test_and_learn_pct = st.slider(
+            "Test-and-learn reserve",
+            min_value=0.0,
+            max_value=0.40,
+            value=0.10,
+            step=0.01,
+            format="%.0f%%",
+            help=(
+                "Fraction of every scenario's budget held back from the LP for "
+                "new audiences, creative tests, and emerging placements. "
+                "Standard strategist practice is 10–15%."
+            ),
+        )
+
+        st.markdown(
+            "**Seasonality multipliers** — set to >1 if you expect productivity "
+            "to beat the historical baseline during the campaign window "
+            "(e.g. January after the Q4 auction spike clears); <1 if you expect "
+            "underperformance (e.g. December CPM inflation). Leave at 1.0 for no adjustment."
+        )
+        seasonality_index: Dict[str, float] = {}
+        if goal_codes:
+            scols = st.columns(min(len(goal_codes), 4))
+            for i, gcode in enumerate(goal_codes):
+                with scols[i % len(scols)]:
+                    mult = st.slider(
+                        _GOAL_LABEL.get(gcode, gcode),
+                        min_value=0.2,
+                        max_value=3.0,
+                        value=1.0,
+                        step=0.05,
+                        key=f"seasonality_{gcode}",
+                    )
+                    if abs(mult - 1.0) > 1e-6:
+                        seasonality_index[gcode] = mult
 
     if st.button("Continue", disabled=not goal_codes or total_budget <= 1):
-        state.complete_module1_and_advance(valid_goals=goal_codes, total_budget=total_budget)
-        safe_rerun()
+        try:
+            finalise_module1(
+                state,
+                raw_objectives=goal_codes,
+                raw_budget=total_budget,
+                raw_currency=currency,
+                raw_duration_days=int(duration_days),
+                raw_goal_values=goal_values or None,
+                raw_test_and_learn_pct=test_and_learn_pct or None,
+                raw_seasonality_index=seasonality_index or None,
+            )
+            safe_rerun()
+        except (Module1ValidationError, ValueError) as e:
+            st.error(f"Could not finalise Module 1: {e}")
 
 
 def module2_ui(state: WizardState) -> None:
